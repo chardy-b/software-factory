@@ -1,0 +1,33 @@
+daemon:
+  capacity: 1
+  state_dir: /var/lib/software-factory/state
+linear:
+  api_key_env: LINEAR_API_KEY  # pragma: allowlist secret -- reference name, not a value
+  states:
+    Needs Triage: e0d094ca-9a01-4724-a9b5-4093b3dcc1a7
+    Ready for Agent: 1d48ba48-29fb-4073-b3ad-ea8ab8f240b6
+    In Progress: ba60d968-082b-4b92-bd30-2cc8072c54dc
+    Needs Input: 6210ccaf-3590-4869-8b58-2dde2abf831e
+    Done: 4747de0e-f178-415c-8e37-287f2869b8b1
+repositories:
+  pacenotes:
+    path: /srv/software-factory/repositories/pacenotes
+    origin: https://github.com/chardy-b/pacenotes-android.git
+    artifact_dir: /var/lib/software-factory/artifacts/pacenotes
+    worktree_dir: /var/lib/software-factory/worktrees/pacenotes
+routing:
+  implementer:
+    tool: codex
+    model: codex-medium
+    session_namespace: software-factory-implementer
+  reviewer:
+    tool: claude
+    model: claude-sonnet
+    session_namespace: software-factory-reviewer
+  repair_cycles: 2
+verification:
+  executables:
+    - git
+    - pytest
+notification:
+  keyholder_grant: software-factory-notifications
