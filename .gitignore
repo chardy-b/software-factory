@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Software Factory local state and secrets
+*.db
+*.sqlite
+*.sqlite-*
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.venv*/
