@@ -3,10 +3,19 @@
 `software-factory` is an installable Python 3.12 command-line foundation for
 validating a single-host software factory's configuration and local prerequisites.
 
-This WIL-131 scope intentionally includes only strict configuration parsing and the
-local-only `doctor` command. It does **not** include a scheduler, SQLite storage,
-ticket claiming, agent execution, pull-request automation, live Linear validation,
-merging, releasing, or deployment.
+WIL-131 provides strict configuration parsing and the local-only `doctor` command.
+WIL-132 adds a local SQLite persistence boundary for versioned run records, exclusive
+ticket leases, worker liveness, attempts, and idempotent events. It does **not** add a
+scheduler, agent execution, pull-request automation, live Linear validation, merging,
+releasing, or deployment.
+
+The store uses SQLite WAL mode, foreign-key enforcement, bounded lease heartbeats, and
+PID plus process-start identity checks. New and pre-existing database files opened by
+the store are forced to mode `0600`. SQLite sidecars are created under SQLite's
+restrictive derived permissions where the platform supports them; this is not a claim
+of protection against hostile same-user pathname replacement races.
+Worker capacity counts all unfinished worker ledger rows whose PID and process-start identity
+exactly match a live process, regardless of lease owner or whether the lease still exists.
 
 ## Install and use
 
