@@ -56,13 +56,55 @@ def test_stale_epoch_cannot_start_or_finish_and_does_not_wedge_owner(tmp_path: P
 
     with pytest.raises(LeaseOwnershipError):
         store.finish_worker("old-w", 0, old)
-    store.finish_worker("old-w", 0, current)
+    with pytest.raises(StoreError):
+        store.finish_worker("old-w", 0, current)
     with pytest.raises(LeaseOwnershipError):
         store.start_worker(worker, old)
     store.start_worker(worker, current)
     with pytest.raises(LeaseOwnershipError):
         store.finish_worker("w", 0, old)
     store.finish_worker("w", 0, current)
+
+
+def test_later_epoch_cannot_finish_prior_attempt_but_can_finish_its_own(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = Store(tmp_path / "db", clock=clock, process_probe=lambda _pid: None)
+    store.initialize()
+    old = claim(store)
+    now = clock.now
+    store.start_attempt(
+        Attempt("old-a", "r1", 0, "implementer", "codex", None, "a" * 40, None, now, None, "/old"),
+        old,
+    )
+    clock.now += timedelta(seconds=2)
+    store.claim_ticket(
+        ClaimRequest("I-1", "ignored", "repo", "branch", "/work"), "two", 2, "boot:new"
+    )
+    current = store.get_lease("I-1")
+
+    with pytest.raises(StoreError):
+        store.finish_attempt("old-a", "passed", current)
+
+    store.start_attempt(
+        Attempt(
+            "current-a",
+            "r1",
+            1,
+            "implementer",
+            "codex",
+            None,
+            "b" * 40,
+            None,
+            clock.now,
+            None,
+            "/current",
+        ),
+        current,
+    )
+    store.finish_attempt("current-a", "passed", current)
+    assert store.get_attempt("current-a").outcome == "passed"
 
 
 def test_owner_aware_capacity_excludes_other_owner(tmp_path: Path) -> None:
@@ -201,10 +243,11 @@ def test_worker_counts_normalize_sqlite_errors(
 
 
 def test_outbox_is_bounded_idempotent_and_fenced(tmp_path: Path) -> None:
-    store = Store(tmp_path / "db")
+    clock = Clock()
+    store = Store(tmp_path / "db", clock=clock, process_probe=lambda _pid: None)
     store.initialize()
     lease = claim(store)
-    now = datetime(2026, 1, 1, tzinfo=UTC)
+    now = clock.now
     store.record_event(Event("e1", "r1", "kind", {}, "k1", now), lease)
     store.record_event(Event("e2", "r1", "kind", {}, "k2", now + timedelta(seconds=1)), lease)
     assert [event.event_id for event in store.undelivered_events(lease, limit=1)] == ["e1"]
@@ -212,3 +255,13 @@ def test_outbox_is_bounded_idempotent_and_fenced(tmp_path: Path) -> None:
     assert store.mark_event_delivered("e1", lease, now + timedelta(seconds=3)) == delivered
     with pytest.raises(ValueError):
         store.undelivered_events(lease, limit=0)
+
+    clock.now += timedelta(seconds=2)
+    store.claim_ticket(
+        ClaimRequest("I-1", "ignored", "repo", "branch", "/work"), "two", 2, "boot:new"
+    )
+    current = store.get_lease("I-1")
+    with pytest.raises(LeaseOwnershipError):
+        store.undelivered_events(lease)
+    assert [event.event_id for event in store.undelivered_events(current)] == ["e2"]
+    assert store.mark_event_delivered("e2", current).delivered_at == clock.now

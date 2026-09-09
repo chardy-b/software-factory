@@ -583,12 +583,14 @@ class Store:
             self._require_lease(connection, lease)
             cursor = connection.execute(
                 "UPDATE workers SET finished_at = ?, exit_code = ? "
-                "WHERE worker_id = ? AND run_id = ? AND finished_at IS NULL",
+                "WHERE worker_id = ? AND run_id = ? AND lease_epoch = ? "
+                "AND finished_at IS NULL",
                 (
                     _timestamp(finished_at or self.clock()),
                     exit_code,
                     worker_id,
                     lease.run_id,
+                    lease.epoch,
                 ),
             )
             if cursor.rowcount != 1:
@@ -652,12 +654,14 @@ class Store:
             self._require_lease(connection, lease)
             cursor = connection.execute(
                 "UPDATE attempts SET outcome = ?, finished_at = ? "
-                "WHERE attempt_id = ? AND run_id = ? AND finished_at IS NULL",
+                "WHERE attempt_id = ? AND run_id = ? AND lease_epoch = ? "
+                "AND finished_at IS NULL",
                 (
                     outcome,
                     _timestamp(finished_at or self.clock()),
                     attempt_id,
                     lease.run_id,
+                    lease.epoch,
                 ),
             )
             if cursor.rowcount != 1:
@@ -730,6 +734,8 @@ class Store:
             raise ValueError("limit must be between 1 and 1000")
         with self._transaction() as connection:
             self._require_lease(connection, lease)
+            # Unlike worker and attempt rows, the outbox is deliberately run-scoped:
+            # a current owner may drain events left by an earlier epoch after a crash.
             rows = connection.execute(
                 "SELECT * FROM events WHERE run_id = ? "
                 "AND delivered_at IS NULL ORDER BY created_at, event_id LIMIT ?",
@@ -742,6 +748,7 @@ class Store:
     ) -> Event:
         with self._transaction() as connection:
             self._require_lease(connection, lease)
+            # Keep delivery run-scoped across epochs so crash recovery can finish the outbox.
             row = connection.execute(
                 "SELECT * FROM events WHERE event_id = ? AND run_id = ?",
                 (event_id, lease.run_id),
