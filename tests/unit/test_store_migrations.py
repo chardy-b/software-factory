@@ -135,6 +135,48 @@ def test_connect_rejects_database_symlink_without_mutating_target(tmp_path: Path
     assert target.stat().st_mode & 0o777 == 0o644
 
 
+def test_sqlite_open_uses_secure_preopen_when_path_is_swapped_to_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "factory.db"
+    target = tmp_path / "target.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+        connection.execute("INSERT INTO marker VALUES ('untouched')")
+    target.chmod(0o644)
+    displaced = tmp_path / "displaced.db"
+    real_connect = sqlite3.connect
+
+    def swap_then_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        path.rename(displaced)
+        path.symlink_to(target)
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", swap_then_connect)
+
+    connection = Store(path).connect()
+    connection.execute("CREATE TABLE safely_opened(value TEXT)")
+    connection.close()
+
+    assert path.is_symlink()
+    assert target.stat().st_mode & 0o777 == 0o644
+    with real_connect(target) as connection:
+        assert connection.execute("SELECT value FROM marker").fetchone()[0] == "untouched"
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'safely_opened'"
+            ).fetchone()[0]
+            == 0
+        )
+    with real_connect(displaced) as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'safely_opened'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
 def test_foreign_keys_and_checks_are_enforced(tmp_path: Path) -> None:
     store = Store(tmp_path / "factory.db")
     store.initialize()

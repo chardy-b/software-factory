@@ -160,7 +160,13 @@ class Store:
             raise StoreError(f"cannot securely open database: {self.path}") from exc
         try:
             os.fchmod(descriptor, 0o600)
-            connection = sqlite3.connect(self.path, isolation_level=None)
+            # Python's sqlite3 API does not expose SQLITE_OPEN_NOFOLLOW, and
+            # ``nofollow`` is not a SQLite URI query parameter. Keep the
+            # O_NOFOLLOW-opened file pinned and have SQLite open that exact
+            # descriptor through Linux procfs, eliminating a second lookup of
+            # the caller-controlled final path component.
+            database_uri = Path(f"/proc/self/fd/{descriptor}").as_uri() + "?mode=rw"
+            connection = sqlite3.connect(database_uri, isolation_level=None, uri=True)
         except sqlite3.Error as exc:
             os.close(descriptor)
             _raise_store_error(exc)
@@ -369,6 +375,9 @@ class Store:
             if existing_lease is not None:
                 if cast(datetime, _datetime(existing_lease["expires_at"])) > now:
                     raise LeaseConflict("issue has an active lease")
+                self._refuse_live_worker(
+                    connection, existing_lease["run_id"], existing_lease["epoch"]
+                )
                 connection.execute(
                     "DELETE FROM leases WHERE linear_issue_id = ?", (request.linear_issue_id,)
                 )

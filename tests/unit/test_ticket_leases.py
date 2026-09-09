@@ -269,9 +269,11 @@ def test_terminal_run_cannot_be_reacquired(tmp_path: Path, terminal_state: Machi
         store.claim_ticket(request, "new", 20, "new-start")
 
 
-def test_expiry_pid_reuse_live_worker_and_capacity(tmp_path: Path) -> None:
+def test_expired_lease_reacquisition_refuses_live_worker_and_preserves_lease(
+    tmp_path: Path,
+) -> None:
     clock = Clock()
-    starts = {10: "reused", 20: "worker-start", 30: "other-start"}
+    starts = {20: "worker-start"}
     store = Store(tmp_path / "factory.db", clock=clock, process_probe=starts.get)
     store.initialize()
     request = ClaimRequest("ISSUE-1", "run-1", "repo", "branch", "/work")
@@ -283,16 +285,46 @@ def test_expiry_pid_reuse_live_worker_and_capacity(tmp_path: Path) -> None:
         ),
         fence,
     )
+    clock.now += timedelta(seconds=2)
+
+    with pytest.raises(LeaseConflict, match="live worker"):
+        store.claim_ticket(request, "new", 40, "new-start", timedelta(seconds=5))
+
+    assert store.get_lease("ISSUE-1") == fence
+
+
+@pytest.mark.parametrize("worker_state", ["dead", "finished"])
+def test_expired_lease_reacquisition_allows_non_live_worker(
+    tmp_path: Path, worker_state: str
+) -> None:
+    clock = Clock()
+    store = Store(tmp_path / "factory.db", clock=clock, process_probe=lambda _pid: None)
+    store.initialize()
+    request = ClaimRequest("ISSUE-1", "run-1", "repo", "branch", "/work")
+    store.claim_ticket(request, "owner", 10, "owner-start", timedelta(seconds=1))
+    fence = store.get_lease("ISSUE-1")
     store.start_worker(
-        Worker("w2", "run-1", "reviewer", "codex", 30, "wrong-start", clock.now, clock.now, "/b"),
+        Worker(
+            "worker",
+            "run-1",
+            "implementer",
+            "codex",
+            20,
+            "worker-start",
+            clock.now,
+            clock.now,
+            "/artifacts",
+        ),
         fence,
     )
+    if worker_state == "finished":
+        store.finish_worker("worker", 0, fence)
     clock.now += timedelta(seconds=2)
 
     resumed = store.claim_ticket(request, "new", 40, "new-start", timedelta(seconds=5))
+
     assert resumed.run_id == "run-1"
-    assert store.active_worker_count_for_owner("new", 40, "new-start") == 0
-    assert store.host_active_worker_count() == 1
+    assert store.get_lease("ISSUE-1").epoch == fence.epoch + 1
 
 
 @pytest.mark.parametrize("mutation", ["release", "park"])
