@@ -369,6 +369,7 @@ class Store:
             run_row = connection.execute(
                 "SELECT * FROM runs WHERE linear_issue_id = ?", (request.linear_issue_id,)
             ).fetchone()
+            is_existing_run = run_row is not None
             existing_lease = connection.execute(
                 "SELECT * FROM leases WHERE linear_issue_id = ?", (request.linear_issue_id,)
             ).fetchone()
@@ -413,6 +414,8 @@ class Store:
                 run_row = connection.execute(
                     "SELECT * FROM runs WHERE run_id = ?", (run_row["run_id"],)
                 ).fetchone()
+            if is_existing_run and existing_lease is None:
+                self._refuse_live_worker(connection, run_row["run_id"], run_row["lease_epoch"])
             epoch = int(run_row["lease_epoch"]) + 1
             connection.execute(
                 "UPDATE runs SET lease_epoch = ? WHERE run_id = ?", (epoch, run_row["run_id"])

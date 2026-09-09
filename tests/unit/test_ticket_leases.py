@@ -372,7 +372,9 @@ def test_lease_removal_refuses_live_worker_and_preserves_state(
         )
 
 
-def test_existing_run_without_lease_refuses_live_worker_then_resumes(tmp_path: Path) -> None:
+def test_existing_run_without_lease_refuses_live_worker_and_preserves_state(
+    tmp_path: Path,
+) -> None:
     clock = Clock()
     store = Store(tmp_path / "factory.db", clock=clock, process_probe=lambda _pid: "worker-start")
     store.initialize()
@@ -395,9 +397,58 @@ def test_existing_run_without_lease_refuses_live_worker_then_resumes(tmp_path: P
     )
     with store.connect() as connection:
         connection.execute("DELETE FROM leases WHERE run_id = 'run-1'")
+        before = tuple(
+            connection.execute(
+                "SELECT machine_state, lease_epoch, updated_at FROM runs WHERE run_id = 'run-1'"
+            ).fetchone()
+        )
+
+    with pytest.raises(LeaseConflict, match="live worker"):
+        store.claim_ticket(request, "new-owner", 30, "new-owner-start")
+
+    with store.connect() as connection:
+        after = tuple(
+            connection.execute(
+                "SELECT machine_state, lease_epoch, updated_at FROM runs WHERE run_id = 'run-1'"
+            ).fetchone()
+        )
+        assert after == before
+        assert connection.execute("SELECT count(*) FROM leases").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("worker_state", ["dead", "finished"])
+def test_existing_run_without_lease_reacquires_with_non_live_worker(
+    tmp_path: Path, worker_state: str
+) -> None:
+    clock = Clock()
+    store = Store(tmp_path / "factory.db", clock=clock, process_probe=lambda _pid: None)
+    store.initialize()
+    request = ClaimRequest("ISSUE-1", "run-1", "repo", "branch", "/work")
+    store.claim_ticket(request, "owner", 10, "owner-start")
+    fence = store.get_lease("ISSUE-1")
+    store.start_worker(
+        Worker(
+            "worker",
+            "run-1",
+            "implementer",
+            "codex",
+            20,
+            "worker-start",
+            clock.now,
+            clock.now,
+            "/artifacts",
+        ),
+        fence,
+    )
+    if worker_state == "finished":
+        store.finish_worker("worker", 0, fence)
+    with store.connect() as connection:
+        connection.execute("DELETE FROM leases WHERE run_id = 'run-1'")
 
     resumed = store.claim_ticket(request, "new-owner", 30, "new-owner-start")
+
     assert resumed.run_id == "run-1"
+    assert store.get_lease("ISSUE-1").epoch == fence.epoch + 1
 
 
 def test_capacity_counts_only_live_unfinished_workers_across_all_lease_owners(
