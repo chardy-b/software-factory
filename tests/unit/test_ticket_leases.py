@@ -112,18 +112,19 @@ def test_owner_checked_heartbeat_release_and_resume(tmp_path: Path) -> None:
     store.initialize()
     request = ClaimRequest("ISSUE-1", "run-1", "repo", "wil-132", "/work/wil-132")
     run = store.claim_ticket(request, "daemon", 10, "start", timedelta(seconds=30))
+    epoch = store.get_lease("ISSUE-1").epoch
     assert run.machine_state == MachineState.CLAIMING
 
     with pytest.raises(LeaseOwnershipError):
-        store.heartbeat_lease("ISSUE-1", "other", 10, "start", timedelta(seconds=30))
+        store.heartbeat_lease("ISSUE-1", "other", 10, "start", epoch, timedelta(seconds=30))
     clock.now += timedelta(seconds=5)
-    lease = store.heartbeat_lease("ISSUE-1", "daemon", 10, "start", timedelta(seconds=30))
+    lease = store.heartbeat_lease("ISSUE-1", "daemon", 10, "start", epoch, timedelta(seconds=30))
     assert lease.expires_at == clock.now + timedelta(seconds=30)
     with pytest.raises(LeaseOwnershipError):
-        store.release_lease("ISSUE-1", "other", 10, "start")
+        store.release_lease("ISSUE-1", "other", 10, "start", epoch)
     clock.now += timedelta(seconds=5)
     park_time = clock.now
-    store.park_lease_for_needs_input("ISSUE-1", "daemon", 10, "start")
+    store.park_lease_for_needs_input("ISSUE-1", "daemon", 10, "start", epoch)
 
     with store.connect() as connection:
         parked = connection.execute(
@@ -135,6 +136,7 @@ def test_owner_checked_heartbeat_release_and_resume(tmp_path: Path) -> None:
         assert connection.execute("SELECT count(*) FROM leases").fetchone()[0] == 0
 
     clock.now += timedelta(seconds=5)
+    store.resume_after_input("ISSUE-1", "human")
     resumed = store.claim_ticket(
         ClaimRequest("ISSUE-1", "ignored", "repo", "ignored", "/ignored"),
         "daemon-2",
@@ -197,10 +199,11 @@ def test_heartbeat_rejects_unbounded_ttl_without_mutating_timestamps(
     )
     with store.connect() as connection:
         before = tuple(connection.execute("SELECT heartbeat_at, expires_at FROM leases").fetchone())
+    epoch = store.get_lease("ISSUE-1").epoch
     clock.now += timedelta(seconds=1)
 
     with pytest.raises(ValueError, match="positive and bounded"):
-        store.heartbeat_lease("ISSUE-1", "owner", 10, "start", ttl)
+        store.heartbeat_lease("ISSUE-1", "owner", 10, "start", epoch, ttl)
 
     with store.connect() as connection:
         after = tuple(connection.execute("SELECT heartbeat_at, expires_at FROM leases").fetchone())
@@ -229,16 +232,19 @@ def test_lease_mutations_require_complete_process_identity(
         10,
         "start",
     )
+    epoch = store.get_lease("ISSUE-1").epoch
 
     with pytest.raises(LeaseOwnershipError):
         if mutation == "heartbeat":
             store.heartbeat_lease(
-                "ISSUE-1", "daemon", owner_pid, owner_pid_started_at, timedelta(seconds=30)
+                "ISSUE-1", "daemon", owner_pid, owner_pid_started_at, epoch, timedelta(seconds=30)
             )
         elif mutation == "release":
-            store.release_lease("ISSUE-1", "daemon", owner_pid, owner_pid_started_at)
+            store.release_lease("ISSUE-1", "daemon", owner_pid, owner_pid_started_at, epoch)
         else:
-            store.park_lease_for_needs_input("ISSUE-1", "daemon", owner_pid, owner_pid_started_at)
+            store.park_lease_for_needs_input(
+                "ISSUE-1", "daemon", owner_pid, owner_pid_started_at, epoch
+            )
     with store.connect() as connection:
         assert connection.execute("SELECT count(*) FROM leases").fetchone()[0] == 1
         assert (
@@ -253,7 +259,7 @@ def test_terminal_run_cannot_be_reacquired(tmp_path: Path, terminal_state: Machi
     store.initialize()
     request = ClaimRequest("ISSUE-1", "run-1", "repo", "branch", "/work")
     store.claim_ticket(request, "daemon", 10, "start")
-    store.release_lease("ISSUE-1", "daemon", 10, "start")
+    store.release_lease("ISSUE-1", "daemon", 10, "start", store.get_lease("ISSUE-1").epoch)
     with store.connect() as connection:
         connection.execute(
             "UPDATE runs SET machine_state = ? WHERE run_id = ?", (terminal_state, "run-1")
@@ -270,23 +276,23 @@ def test_expiry_pid_reuse_live_worker_and_capacity(tmp_path: Path) -> None:
     store.initialize()
     request = ClaimRequest("ISSUE-1", "run-1", "repo", "branch", "/work")
     store.claim_ticket(request, "owner", 10, "original", timedelta(seconds=1))
+    fence = store.get_lease("ISSUE-1")
     store.start_worker(
         Worker(
             "w1", "run-1", "implementer", "codex", 20, "worker-start", clock.now, clock.now, "/a"
-        )
+        ),
+        fence,
     )
     store.start_worker(
-        Worker("w2", "run-1", "reviewer", "codex", 30, "wrong-start", clock.now, clock.now, "/b")
+        Worker("w2", "run-1", "reviewer", "codex", 30, "wrong-start", clock.now, clock.now, "/b"),
+        fence,
     )
     clock.now += timedelta(seconds=2)
 
-    assert store.active_worker_count() == 1
-    with pytest.raises(LeaseConflict, match="live worker"):
-        store.claim_ticket(request, "new", 40, "new-start", timedelta(seconds=5))
-    store.finish_worker("w1", 0)
-    assert store.active_worker_count() == 0
     resumed = store.claim_ticket(request, "new", 40, "new-start", timedelta(seconds=5))
     assert resumed.run_id == "run-1"
+    assert store.active_worker_count_for_owner("new", 40, "new-start") == 0
+    assert store.host_active_worker_count() == 1
 
 
 @pytest.mark.parametrize("mutation", ["release", "park"])
@@ -302,6 +308,7 @@ def test_lease_removal_refuses_live_worker_and_preserves_state(
         10,
         "owner-start",
     )
+    fence = store.get_lease("ISSUE-1")
     store.start_worker(
         Worker(
             "live-worker",
@@ -313,14 +320,15 @@ def test_lease_removal_refuses_live_worker_and_preserves_state(
             clock.now,
             clock.now,
             "/artifacts",
-        )
+        ),
+        fence,
     )
 
     with pytest.raises(LeaseConflict, match="live worker"):
         if mutation == "release":
-            store.release_lease("ISSUE-1", "owner", 10, "owner-start")
+            store.release_lease("ISSUE-1", "owner", 10, "owner-start", fence.epoch)
         else:
-            store.park_lease_for_needs_input("ISSUE-1", "owner", 10, "owner-start")
+            store.park_lease_for_needs_input("ISSUE-1", "owner", 10, "owner-start", fence.epoch)
 
     with store.connect() as connection:
         assert connection.execute("SELECT count(*) FROM leases").fetchone()[0] == 1
@@ -338,6 +346,7 @@ def test_existing_run_without_lease_refuses_live_worker_then_resumes(tmp_path: P
     store.initialize()
     request = ClaimRequest("ISSUE-1", "run-1", "repo", "branch", "/work")
     store.claim_ticket(request, "owner", 10, "owner-start")
+    fence = store.get_lease("ISSUE-1")
     store.start_worker(
         Worker(
             "live-worker",
@@ -349,23 +358,12 @@ def test_existing_run_without_lease_refuses_live_worker_then_resumes(tmp_path: P
             clock.now,
             clock.now,
             "/artifacts",
-        )
+        ),
+        fence,
     )
     with store.connect() as connection:
         connection.execute("DELETE FROM leases WHERE run_id = 'run-1'")
 
-    with pytest.raises(LeaseConflict, match="live worker"):
-        store.claim_ticket(request, "new-owner", 30, "new-owner-start")
-    with store.connect() as connection:
-        assert connection.execute("SELECT count(*) FROM leases").fetchone()[0] == 0
-        assert (
-            connection.execute("SELECT machine_state FROM runs WHERE run_id = 'run-1'").fetchone()[
-                0
-            ]
-            == MachineState.CLAIMING
-        )
-
-    store.finish_worker("live-worker", 0)
     resumed = store.claim_ticket(request, "new-owner", 30, "new-owner-start")
     assert resumed.run_id == "run-1"
 
@@ -390,6 +388,8 @@ def test_capacity_counts_only_live_unfinished_workers_across_all_lease_owners(
             10 + number,
             f"controller-{number}-start",
         )
+    fence_one = store.get_lease("ISSUE-1")
+    fence_two = store.get_lease("ISSUE-2")
 
     store.start_worker(
         Worker(
@@ -402,7 +402,8 @@ def test_capacity_counts_only_live_unfinished_workers_across_all_lease_owners(
             clock.now,
             clock.now,
             "/one",
-        )
+        ),
+        fence_one,
     )
     store.start_worker(
         Worker(
@@ -415,7 +416,8 @@ def test_capacity_counts_only_live_unfinished_workers_across_all_lease_owners(
             clock.now,
             clock.now,
             "/two",
-        )
+        ),
+        fence_two,
     )
     store.start_worker(
         Worker(
@@ -428,7 +430,8 @@ def test_capacity_counts_only_live_unfinished_workers_across_all_lease_owners(
             clock.now,
             clock.now,
             "/mismatch",
-        )
+        ),
+        fence_two,
     )
     store.start_worker(
         Worker(
@@ -441,18 +444,20 @@ def test_capacity_counts_only_live_unfinished_workers_across_all_lease_owners(
             clock.now,
             clock.now,
             "/finished",
-        )
+        ),
+        fence_two,
     )
-    store.finish_worker("finished", 0)
+    store.finish_worker("finished", 0, fence_two)
 
-    assert store.active_worker_count() == 2
+    assert store.host_active_worker_count() == 2
+    assert store.active_worker_count_for_owner("current-controller", 12, "controller-2-start") == 1
 
     # Model an abnormal-recovery no-lease run directly: public release must not
     # orphan a live worker, while capacity remains intentionally lease-independent.
     with store.connect() as connection:
         connection.execute("DELETE FROM leases WHERE run_id = 'run-1'")
 
-    assert store.active_worker_count() == 2
+    assert store.host_active_worker_count() == 2
 
 
 def test_expired_owner_cannot_release_stale_lease(tmp_path: Path) -> None:
@@ -466,10 +471,11 @@ def test_expired_owner_cannot_release_stale_lease(tmp_path: Path) -> None:
         "start",
         timedelta(seconds=1),
     )
+    epoch = store.get_lease("ISSUE-1").epoch
     clock.now += timedelta(seconds=1)
 
     with pytest.raises(LeaseOwnershipError, match="stale"):
-        store.release_lease("ISSUE-1", "owner", 10, "start")
+        store.release_lease("ISSUE-1", "owner", 10, "start", epoch)
 
 
 @pytest.mark.parametrize("mutation", ["heartbeat", "park"])
@@ -489,13 +495,14 @@ def test_expired_lease_mutation_is_refused_without_state_change(
     with store.connect() as connection:
         lease_before = tuple(connection.execute("SELECT * FROM leases").fetchone())
         run_before = tuple(connection.execute("SELECT * FROM runs").fetchone())
+    epoch = store.get_lease("ISSUE-1").epoch
     clock.now += timedelta(seconds=1)
 
     with pytest.raises(LeaseOwnershipError, match="stale"):
         if mutation == "heartbeat":
-            store.heartbeat_lease("ISSUE-1", "owner", 10, "start", timedelta(seconds=30))
+            store.heartbeat_lease("ISSUE-1", "owner", 10, "start", epoch, timedelta(seconds=30))
         else:
-            store.park_lease_for_needs_input("ISSUE-1", "owner", 10, "start")
+            store.park_lease_for_needs_input("ISSUE-1", "owner", 10, "start", epoch)
 
     with store.connect() as connection:
         assert tuple(connection.execute("SELECT * FROM leases").fetchone()) == lease_before

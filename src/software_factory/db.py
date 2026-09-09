@@ -15,7 +15,7 @@ from typing import Any, cast
 
 from software_factory.models import Attempt, ClaimRequest, Event, Lease, MachineState, Run, Worker
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 
@@ -35,17 +35,55 @@ class LeaseOwnershipError(StoreError):
     """A lease mutation was attempted by a stale or different owner."""
 
 
+class ConstraintStoreError(StoreError):
+    """A public write violated a database uniqueness, foreign-key, or check constraint."""
+
+
+class RetriableStoreError(StoreError):
+    """A database lock or busy timeout prevented an operation and may be retried."""
+
+
+class ProcessProbeError(StoreError):
+    """Process liveness could not be determined safely on this host."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
 def _process_start_identity(pid: int) -> str | None:
-    """Return the Linux kernel process start tick, without inspecting credentials."""
+    """Return boot ID plus Linux process start tick; None means the PID is absent."""
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        return stat[stat.rfind(")") + 2 :].split()[19]
-    except (OSError, UnicodeDecodeError, IndexError):
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_bytes().strip().decode("ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ProcessProbeError("Linux /proc boot identity is unavailable") from exc
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_bytes()
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise ProcessProbeError(
+            f"Linux /proc process identity is unreadable for PID {pid}"
+        ) from exc
+    closing = stat.rfind(b")")
+    fields = stat[closing + 2 :].split() if closing >= 0 else []
+    if len(fields) <= 19 or not boot_id:
+        raise ProcessProbeError(f"Linux /proc process identity is malformed for PID {pid}")
+    try:
+        starttime = fields[19].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ProcessProbeError(f"Linux /proc process identity is malformed for PID {pid}") from exc
+    return f"{boot_id}:{starttime}"
+
+
+def _raise_store_error(exc: sqlite3.Error) -> None:
+    if isinstance(exc, sqlite3.IntegrityError):
+        raise ConstraintStoreError("database constraint rejected the operation") from exc
+    if isinstance(exc, sqlite3.OperationalError) and any(
+        word in str(exc).lower() for word in ("locked", "busy")
+    ):
+        raise RetriableStoreError("database is busy; the operation may be retried") from exc
+    raise StoreError("database operation failed") from exc
 
 
 def _timestamp(value: datetime) -> str:
@@ -123,23 +161,39 @@ class Store:
         try:
             os.fchmod(descriptor, 0o600)
             connection = sqlite3.connect(self.path, isolation_level=None)
+        except sqlite3.Error as exc:
+            os.close(descriptor)
+            _raise_store_error(exc)
         except BaseException:
             os.close(descriptor)
             raise
         os.close(descriptor)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms:d}")
-        connection.execute("PRAGMA journal_mode = WAL")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms:d}")
+            connection.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.Error as exc:
+            connection.close()
+            _raise_store_error(exc)
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
     def _transaction(self, mode: str = "IMMEDIATE") -> Iterator[sqlite3.Connection]:
-        connection = self.connect()
+        try:
+            connection = self.connect()
+        except sqlite3.Error as exc:
+            _raise_store_error(exc)
         try:
             connection.execute(f"BEGIN {mode}")
             yield connection
             connection.commit()
+        except sqlite3.Error as exc:
+            connection.rollback()
+            _raise_store_error(exc)
         except BaseException:
             connection.rollback()
             raise
@@ -154,11 +208,30 @@ class Store:
             ).fetchone()
             if table:
                 versions = connection.execute("SELECT version FROM schema_version").fetchall()
+                if len(versions) == 1 and versions[0][0] == 1:
+                    self._migrate_v1(connection)
+                    return
                 if len(versions) != 1 or versions[0][0] != SCHEMA_VERSION:
                     version = versions[0][0] if versions else "missing"
                     raise UnsupportedSchemaVersion(f"unsupported schema version: {version}")
                 return
             self._create_schema(connection)
+
+    @staticmethod
+    def _migrate_v1(connection: sqlite3.Connection) -> None:
+        statements = (
+            "ALTER TABLE runs ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch >= 0)",  # noqa: E501
+            "ALTER TABLE runs ADD COLUMN input_resume_authorized_at TEXT",
+            "ALTER TABLE runs ADD COLUMN input_resume_authorized_by TEXT",
+            "ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 1 CHECK(epoch > 0)",
+            "ALTER TABLE workers ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 1 CHECK(lease_epoch > 0)",  # noqa: E501
+            "ALTER TABLE attempts ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 1 CHECK(lease_epoch > 0)",  # noqa: E501
+            "ALTER TABLE events ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 1 CHECK(lease_epoch > 0)",  # noqa: E501
+            "UPDATE runs SET lease_epoch = COALESCE((SELECT epoch FROM leases WHERE leases.run_id = runs.run_id), 1)",  # noqa: E501
+            "UPDATE schema_version SET version = 2",
+        )
+        for statement in statements:
+            connection.execute(statement)
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         machine_states = ",".join(f"'{state.value}'" for state in MachineState)
@@ -166,7 +239,7 @@ class Store:
         schema = (""  # nosec B608  # noqa: S608
             f"""
             CREATE TABLE schema_version(version INTEGER NOT NULL CHECK(version >= 1));
-            INSERT INTO schema_version VALUES (1);
+            INSERT INTO schema_version VALUES (2);
             CREATE TABLE runs(
               run_id TEXT PRIMARY KEY, linear_issue_id TEXT NOT NULL UNIQUE,
               repository_key TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL,
@@ -176,13 +249,16 @@ class Store:
               cycle_count INTEGER NOT NULL CHECK(cycle_count >= 0), created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL, last_head_sha TEXT,
               implementer TEXT, reviewer TEXT
+              , lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch >= 0)
+              , input_resume_authorized_at TEXT, input_resume_authorized_by TEXT
             );
             CREATE TABLE leases(
               linear_issue_id TEXT PRIMARY KEY REFERENCES runs(linear_issue_id) ON DELETE CASCADE,
               run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id) ON DELETE CASCADE,
               owner_instance TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK(owner_pid > 0),
               owner_pid_started_at TEXT NOT NULL, acquired_at TEXT NOT NULL,
-              heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL
+              heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+              epoch INTEGER NOT NULL CHECK(epoch > 0)
             );
             CREATE TABLE workers(
               worker_id TEXT PRIMARY KEY,
@@ -191,6 +267,7 @@ class Store:
               pid INTEGER NOT NULL CHECK(pid > 0), pid_started_at TEXT NOT NULL,
               started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, finished_at TEXT,
               exit_code INTEGER, artifact_dir TEXT NOT NULL,
+              lease_epoch INTEGER NOT NULL CHECK(lease_epoch > 0),
               CHECK(
                 (finished_at IS NULL AND exit_code IS NULL)
                 OR (finished_at IS NOT NULL AND exit_code IS NOT NULL)
@@ -203,13 +280,15 @@ class Store:
               kind TEXT NOT NULL CHECK(kind IN ('implementer','reviewer')), tool TEXT NOT NULL,
               session_id TEXT, exact_head_sha TEXT NOT NULL,
               outcome TEXT, started_at TEXT NOT NULL, finished_at TEXT, artifact_dir TEXT NOT NULL,
+              lease_epoch INTEGER NOT NULL CHECK(lease_epoch > 0),
               CHECK(outcome IS NULL OR finished_at IS NOT NULL)
             );
             CREATE TABLE events(
               event_id TEXT PRIMARY KEY,
               run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
               type TEXT NOT NULL, payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
-              created_at TEXT NOT NULL, delivered_at TEXT
+              created_at TEXT NOT NULL, delivered_at TEXT,
+              lease_epoch INTEGER NOT NULL CHECK(lease_epoch > 0)
             );
             CREATE INDEX workers_run_unfinished ON workers(run_id) WHERE finished_at IS NULL;
             CREATE INDEX attempts_run_cycle ON attempts(run_id, cycle);
@@ -228,15 +307,47 @@ class Store:
             raise ValueError("lease ttl must be positive and bounded")
         return now + ttl
 
-    def _refuse_live_worker(self, connection: sqlite3.Connection, run_id: str) -> None:
+    def _refuse_live_worker(self, connection: sqlite3.Connection, run_id: str, epoch: int) -> None:
         workers = connection.execute(
-            "SELECT pid, pid_started_at FROM workers WHERE run_id = ? AND finished_at IS NULL",
-            (run_id,),
+            "SELECT pid, pid_started_at FROM workers WHERE run_id = ? AND lease_epoch = ? "
+            "AND finished_at IS NULL",
+            (run_id, epoch),
         ).fetchall()
         if any(self.process_probe(row["pid"]) == row["pid_started_at"] for row in workers):
             raise LeaseConflict(
                 "run has a live worker; finish it before removing or reacquiring the lease"
             )
+
+    def _require_lease(self, connection: sqlite3.Connection, lease: Lease) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM leases WHERE run_id = ? AND owner_instance = ? AND owner_pid = ? "
+            "AND owner_pid_started_at = ? AND epoch = ? AND expires_at > ?",
+            (
+                lease.run_id,
+                lease.owner_instance,
+                lease.owner_pid,
+                lease.owner_pid_started_at,
+                lease.epoch,
+                _timestamp(self.clock()),
+            ),
+        ).fetchone()
+        if row is None:
+            raise LeaseOwnershipError(
+                "lease fence is stale, expired, absent, or belongs to another owner"
+            )
+        return cast(sqlite3.Row, row)
+
+    def get_lease(self, linear_issue_id: str) -> Lease:
+        try:
+            with closing(self.connect()) as connection:
+                row = connection.execute(
+                    "SELECT * FROM leases WHERE linear_issue_id = ?", (linear_issue_id,)
+                ).fetchone()
+        except sqlite3.Error as exc:
+            _raise_store_error(exc)
+        if row is None:
+            raise KeyError(linear_issue_id)
+        return self._lease(row)
 
     def claim_ticket(
         self,
@@ -252,8 +363,6 @@ class Store:
             run_row = connection.execute(
                 "SELECT * FROM runs WHERE linear_issue_id = ?", (request.linear_issue_id,)
             ).fetchone()
-            if run_row is not None:
-                self._refuse_live_worker(connection, run_row["run_id"])
             existing_lease = connection.execute(
                 "SELECT * FROM leases WHERE linear_issue_id = ?", (request.linear_issue_id,)
             ).fetchone()
@@ -284,15 +393,23 @@ class Store:
             elif run_row["machine_state"] in (MachineState.COMPLETE, MachineState.FAILED):
                 raise LeaseConflict("terminal run cannot be reacquired")
             elif run_row["machine_state"] == MachineState.NEEDS_INPUT:
+                if run_row["input_resume_authorized_at"] is None:
+                    raise LeaseConflict("NEEDS_INPUT run requires explicit human-authorized resume")
                 connection.execute(
-                    "UPDATE runs SET machine_state = ?, updated_at = ? WHERE run_id = ?",
+                    "UPDATE runs SET machine_state = ?, updated_at = ?, "
+                    "input_resume_authorized_at = NULL, input_resume_authorized_by = NULL "
+                    "WHERE run_id = ?",
                     (MachineState.CLAIMING, _timestamp(now), run_row["run_id"]),
                 )
                 run_row = connection.execute(
                     "SELECT * FROM runs WHERE run_id = ?", (run_row["run_id"],)
                 ).fetchone()
+            epoch = int(run_row["lease_epoch"]) + 1
             connection.execute(
-                "INSERT INTO leases VALUES(?,?,?,?,?,?,?,?)",
+                "UPDATE runs SET lease_epoch = ? WHERE run_id = ?", (epoch, run_row["run_id"])
+            )
+            connection.execute(
+                "INSERT INTO leases VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     request.linear_issue_id,
                     run_row["run_id"],
@@ -302,6 +419,7 @@ class Store:
                     _timestamp(now),
                     _timestamp(now),
                     _timestamp(expires),
+                    epoch,
                 ),
             )
             return self._run(run_row)
@@ -312,6 +430,7 @@ class Store:
         owner_instance: str,
         owner_pid: int,
         owner_pid_started_at: str,
+        epoch: int,
         ttl: timedelta,
     ) -> Lease:
         now = self.clock()
@@ -320,7 +439,7 @@ class Store:
             cursor = connection.execute(
                 "UPDATE leases SET heartbeat_at = ?, expires_at = ? "
                 "WHERE linear_issue_id = ? AND owner_instance = ? AND owner_pid = ? "
-                "AND owner_pid_started_at = ? AND expires_at > ?",
+                "AND owner_pid_started_at = ? AND epoch = ? AND expires_at > ?",
                 (
                     _timestamp(now),
                     _timestamp(expires),
@@ -328,6 +447,7 @@ class Store:
                     owner_instance,
                     owner_pid,
                     owner_pid_started_at,
+                    epoch,
                     _timestamp(now),
                 ),
             )
@@ -344,23 +464,25 @@ class Store:
         owner_instance: str,
         owner_pid: int,
         owner_pid_started_at: str,
+        epoch: int,
     ) -> None:
         now = self.clock()
         with self._transaction() as connection:
             lease = connection.execute(
-                "SELECT run_id FROM leases WHERE linear_issue_id = ? AND owner_instance = ? "
-                "AND owner_pid = ? AND owner_pid_started_at = ? AND expires_at > ?",
+                "SELECT run_id, epoch FROM leases WHERE linear_issue_id = ? AND owner_instance = ? "
+                "AND owner_pid = ? AND owner_pid_started_at = ? AND epoch = ? AND expires_at > ?",
                 (
                     linear_issue_id,
                     owner_instance,
                     owner_pid,
                     owner_pid_started_at,
+                    epoch,
                     _timestamp(now),
                 ),
             ).fetchone()
             if lease is None:
                 raise LeaseOwnershipError("lease is stale, absent, or belongs to another owner")
-            self._refuse_live_worker(connection, lease["run_id"])
+            self._refuse_live_worker(connection, lease["run_id"], lease["epoch"])
             connection.execute(
                 "DELETE FROM leases WHERE linear_issue_id = ?",
                 (linear_issue_id,),
@@ -372,6 +494,7 @@ class Store:
         owner_instance: str,
         owner_pid: int,
         owner_pid_started_at: str,
+        epoch: int,
     ) -> None:
         now = self.clock()
         identity = (
@@ -385,12 +508,12 @@ class Store:
             lease = connection.execute(
                 "SELECT run_id FROM leases WHERE linear_issue_id = ? "
                 "AND owner_instance = ? AND owner_pid = ? AND owner_pid_started_at = ? "
-                "AND expires_at > ?",
-                identity,
+                "AND epoch = ? AND expires_at > ?",
+                (*identity[:-1], epoch, identity[-1]),
             ).fetchone()
             if lease is None:
                 raise LeaseOwnershipError("lease is stale, absent, or belongs to another owner")
-            self._refuse_live_worker(connection, lease["run_id"])
+            self._refuse_live_worker(connection, lease["run_id"], epoch)
             connection.execute(
                 "UPDATE runs SET machine_state = ?, updated_at = ? WHERE run_id = ?",
                 (MachineState.NEEDS_INPUT, _timestamp(now), lease["run_id"]),
@@ -400,10 +523,31 @@ class Store:
                 (linear_issue_id,),
             )
 
-    def start_worker(self, worker: Worker) -> None:
+    def resume_after_input(self, linear_issue_id: str, authorized_by: str) -> None:
+        if not authorized_by.strip():
+            raise ValueError("authorized_by must be nonempty")
         with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE runs SET input_resume_authorized_at = ?, input_resume_authorized_by = ?, "
+                "updated_at = ? WHERE linear_issue_id = ? AND machine_state = ?",
+                (
+                    _timestamp(self.clock()),
+                    authorized_by,
+                    _timestamp(self.clock()),
+                    linear_issue_id,
+                    MachineState.NEEDS_INPUT,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("run is absent or is not waiting for input")
+
+    def start_worker(self, worker: Worker, lease: Lease) -> None:
+        with self._transaction() as connection:
+            self._require_lease(connection, lease)
+            if worker.run_id != lease.run_id:
+                raise LeaseOwnershipError("worker run does not match lease fence")
             connection.execute(
-                "INSERT INTO workers VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO workers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     worker.worker_id,
                     worker.run_id,
@@ -416,34 +560,63 @@ class Store:
                     _timestamp(worker.finished_at) if worker.finished_at else None,
                     worker.exit_code,
                     worker.artifact_dir,
+                    lease.epoch,
                 ),
             )
 
     def finish_worker(
-        self, worker_id: str, exit_code: int, finished_at: datetime | None = None
+        self, worker_id: str, exit_code: int, lease: Lease, finished_at: datetime | None = None
     ) -> None:
         with self._transaction() as connection:
+            self._require_lease(connection, lease)
             cursor = connection.execute(
                 "UPDATE workers SET finished_at = ?, exit_code = ? "
-                "WHERE worker_id = ? AND finished_at IS NULL",
-                (_timestamp(finished_at or self.clock()), exit_code, worker_id),
+                "WHERE worker_id = ? AND run_id = ? AND finished_at IS NULL",
+                (
+                    _timestamp(finished_at or self.clock()),
+                    exit_code,
+                    worker_id,
+                    lease.run_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise StoreError("worker is absent or already finished")
 
-    def active_worker_count(self) -> int:
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                "SELECT pid, pid_started_at FROM workers WHERE finished_at IS NULL"
-            ).fetchall()
+    def host_active_worker_count(self) -> int:
+        try:
+            with closing(self.connect()) as connection:
+                rows = connection.execute(
+                    "SELECT pid, pid_started_at FROM workers WHERE finished_at IS NULL"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            _raise_store_error(exc)
         return sum(self.process_probe(row["pid"]) == row["pid_started_at"] for row in rows)
 
-    def start_attempt(self, attempt: Attempt) -> None:
+    def active_worker_count_for_owner(
+        self, owner_instance: str, owner_pid: int, owner_pid_started_at: str
+    ) -> int:
+        try:
+            with closing(self.connect()) as connection:
+                rows = connection.execute(
+                    "SELECT w.pid, w.pid_started_at FROM workers w JOIN leases l "
+                    "ON l.run_id = w.run_id AND l.epoch = w.lease_epoch "
+                    "WHERE w.finished_at IS NULL AND l.owner_instance = ? AND l.owner_pid = ? "
+                    "AND l.owner_pid_started_at = ? AND l.expires_at > ?",
+                    (owner_instance, owner_pid, owner_pid_started_at, _timestamp(self.clock())),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            _raise_store_error(exc)
+        return sum(self.process_probe(row["pid"]) == row["pid_started_at"] for row in rows)
+
+    def start_attempt(self, attempt: Attempt, lease: Lease) -> None:
         if not _SHA.fullmatch(attempt.exact_head_sha):
             raise ValueError("exact_head_sha must be an exact 40- or 64-character hexadecimal SHA")
         with self._transaction() as connection:
+            self._require_lease(connection, lease)
+            if attempt.run_id != lease.run_id:
+                raise LeaseOwnershipError("attempt run does not match lease fence")
             connection.execute(
-                "INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     attempt.attempt_id,
                     attempt.run_id,
@@ -456,26 +629,36 @@ class Store:
                     _timestamp(attempt.started_at),
                     _timestamp(attempt.finished_at) if attempt.finished_at else None,
                     attempt.artifact_dir,
+                    lease.epoch,
                 ),
             )
 
     def finish_attempt(
-        self, attempt_id: str, outcome: str, finished_at: datetime | None = None
+        self, attempt_id: str, outcome: str, lease: Lease, finished_at: datetime | None = None
     ) -> None:
         with self._transaction() as connection:
+            self._require_lease(connection, lease)
             cursor = connection.execute(
                 "UPDATE attempts SET outcome = ?, finished_at = ? "
-                "WHERE attempt_id = ? AND finished_at IS NULL",
-                (outcome, _timestamp(finished_at or self.clock()), attempt_id),
+                "WHERE attempt_id = ? AND run_id = ? AND finished_at IS NULL",
+                (
+                    outcome,
+                    _timestamp(finished_at or self.clock()),
+                    attempt_id,
+                    lease.run_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise StoreError("attempt is absent or already finished")
 
     def get_attempt(self, attempt_id: str) -> Attempt:
-        with closing(self.connect()) as connection:
-            row = connection.execute(
-                "SELECT * FROM attempts WHERE attempt_id = ?", (attempt_id,)
-            ).fetchone()
+        try:
+            with closing(self.connect()) as connection:
+                row = connection.execute(
+                    "SELECT * FROM attempts WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+        except sqlite3.Error as exc:
+            _raise_store_error(exc)
         if row is None:
             raise KeyError(attempt_id)
         return Attempt(
@@ -492,7 +675,7 @@ class Store:
             artifact_dir=row["artifact_dir"],
         )
 
-    def record_event(self, event: Event) -> Event:
+    def record_event(self, event: Event, lease: Lease) -> Event:
         _validate_json(event.payload)
         try:
             payload = json.dumps(
@@ -501,6 +684,9 @@ class Store:
         except (TypeError, ValueError) as exc:
             raise ValueError("event payload must be valid JSON") from exc
         with self._transaction() as connection:
+            self._require_lease(connection, lease)
+            if event.run_id != lease.run_id:
+                raise LeaseOwnershipError("event run does not match lease fence")
             existing = connection.execute(
                 "SELECT * FROM events WHERE idempotency_key = ?", (event.idempotency_key,)
             ).fetchone()
@@ -513,7 +699,7 @@ class Store:
                     raise StoreError("idempotency key conflicts with an existing event")
                 return self._event(existing)
             connection.execute(
-                "INSERT INTO events VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",
                 (
                     event.event_id,
                     event.run_id,
@@ -522,9 +708,43 @@ class Store:
                     event.idempotency_key,
                     _timestamp(event.created_at),
                     _timestamp(event.delivered_at) if event.delivered_at else None,
+                    lease.epoch,
                 ),
             )
             return event
+
+    def undelivered_events(self, lease: Lease, *, limit: int = 100) -> list[Event]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self._transaction() as connection:
+            self._require_lease(connection, lease)
+            rows = connection.execute(
+                "SELECT * FROM events WHERE run_id = ? "
+                "AND delivered_at IS NULL ORDER BY created_at, event_id LIMIT ?",
+                (lease.run_id, limit),
+            ).fetchall()
+            return [self._event(row) for row in rows]
+
+    def mark_event_delivered(
+        self, event_id: str, lease: Lease, delivered_at: datetime | None = None
+    ) -> Event:
+        with self._transaction() as connection:
+            self._require_lease(connection, lease)
+            row = connection.execute(
+                "SELECT * FROM events WHERE event_id = ? AND run_id = ?",
+                (event_id, lease.run_id),
+            ).fetchone()
+            if row is None:
+                raise StoreError("event is absent or belongs to another lease epoch")
+            if row["delivered_at"] is None:
+                connection.execute(
+                    "UPDATE events SET delivered_at = ? WHERE event_id = ?",
+                    (_timestamp(delivered_at or self.clock()), event_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM events WHERE event_id = ?", (event_id,)
+                ).fetchone()
+            return self._event(row)
 
     @staticmethod
     def _run(row: sqlite3.Row) -> Run:
@@ -555,6 +775,7 @@ class Store:
             acquired_at=cast(datetime, _datetime(row["acquired_at"])),
             heartbeat_at=cast(datetime, _datetime(row["heartbeat_at"])),
             expires_at=cast(datetime, _datetime(row["expires_at"])),
+            epoch=row["epoch"],
         )
 
     @staticmethod

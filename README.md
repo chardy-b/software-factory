@@ -10,12 +10,18 @@ scheduler, agent execution, pull-request automation, live Linear validation, mer
 releasing, or deployment.
 
 The store uses SQLite WAL mode, foreign-key enforcement, bounded lease heartbeats, and
-PID plus process-start identity checks. New and pre-existing database files opened by
+Linux boot ID plus PID/process-start identity checks that fail closed when `/proc` cannot
+be read. Lease epochs fence every worker, attempt, and event lifecycle write. New and pre-existing database files opened by
 the store are forced to mode `0600`. SQLite sidecars are created under SQLite's
 restrictive derived permissions where the platform supports them; this is not a claim
 of protection against hostile same-user pathname replacement races.
-Worker capacity counts all unfinished worker ledger rows whose PID and process-start identity
-exactly match a live process, regardless of lease owner or whether the lease still exists.
+`active_worker_count_for_owner` counts only live unfinished workers stamped by that
+controller's current, unexpired leases. The separately named `host_active_worker_count`
+provides conservative host-global diagnostics. Runs parked in `NEEDS_INPUT` require an
+explicit `resume_after_input` authorization before they can be claimed again. The event
+outbox supports bounded ordered retrieval and idempotent delivery marking under the same
+lease fence. Public SQLite failures are reported as store constraint, retriable-locking,
+or general store errors. Schema version 1 databases migrate transactionally to version 2.
 
 ## Install and use
 

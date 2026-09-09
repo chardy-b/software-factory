@@ -5,20 +5,28 @@ from pathlib import Path
 import pytest
 
 from software_factory import db
-from software_factory.db import SCHEMA_VERSION, Store, StoreError, UnsupportedSchemaVersion
-from software_factory.models import MachineState
+from software_factory.db import (
+    SCHEMA_VERSION,
+    ProcessProbeError,
+    Store,
+    StoreError,
+    UnsupportedSchemaVersion,
+)
+from software_factory.models import ClaimRequest, MachineState
 
 
-def test_process_start_identity_treats_undecodable_stat_as_missing(
+def test_process_start_identity_rejects_undecodable_starttime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def raise_decode_error(_path: Path, *, encoding: str) -> str:
-        assert encoding == "ascii"
-        raise UnicodeDecodeError("ascii", b"\xff", 0, 1, "ordinal not in range")
+    stat = b"123 (present process) S " + b" ".join([b"0"] * 18 + [b"\xff"])
+    reads = {
+        Path("/proc/sys/kernel/random/boot_id"): b"boot-id\n",
+        Path("/proc/123/stat"): stat,
+    }
+    monkeypatch.setattr(Path, "read_bytes", lambda path: reads[path])
 
-    monkeypatch.setattr(Path, "read_text", raise_decode_error)
-
-    assert db._process_start_identity(123) is None
+    with pytest.raises(ProcessProbeError, match="malformed"):
+        db._process_start_identity(123)
 
 
 def test_initialize_creates_versioned_schema_and_is_repeatable(tmp_path: Path) -> None:
@@ -58,6 +66,50 @@ def test_future_schema_is_refused_without_downgrade(tmp_path: Path) -> None:
         sqlite3.connect(path).execute("SELECT version FROM schema_version").fetchone()[0]
         == SCHEMA_VERSION + 1
     )
+
+
+def test_version_one_database_is_migrated_for_fencing(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_version(version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES(1);
+        CREATE TABLE runs(
+          run_id TEXT PRIMARY KEY, linear_issue_id TEXT UNIQUE, repository_key TEXT,
+          branch TEXT, worktree TEXT, pr_number INTEGER, machine_state TEXT,
+          cycle_count INTEGER, created_at TEXT, updated_at TEXT, last_head_sha TEXT,
+          implementer TEXT, reviewer TEXT
+        );
+        CREATE TABLE leases(
+          linear_issue_id TEXT PRIMARY KEY, run_id TEXT UNIQUE, owner_instance TEXT,
+          owner_pid INTEGER, owner_pid_started_at TEXT, acquired_at TEXT,
+          heartbeat_at TEXT, expires_at TEXT
+        );
+        CREATE TABLE workers(
+          worker_id TEXT PRIMARY KEY, run_id TEXT, kind TEXT, tool TEXT, pid INTEGER,
+          pid_started_at TEXT, started_at TEXT, heartbeat_at TEXT, finished_at TEXT,
+          exit_code INTEGER, artifact_dir TEXT
+        );
+        CREATE TABLE attempts(
+          attempt_id TEXT PRIMARY KEY, run_id TEXT, cycle INTEGER, kind TEXT, tool TEXT,
+          session_id TEXT, exact_head_sha TEXT, outcome TEXT, started_at TEXT,
+          finished_at TEXT, artifact_dir TEXT
+        );
+        CREATE TABLE events(
+          event_id TEXT PRIMARY KEY, run_id TEXT, type TEXT, payload_json TEXT,
+          idempotency_key TEXT, created_at TEXT, delivered_at TEXT
+        );
+        """
+    )
+    connection.close()
+
+    Store(path).initialize()
+
+    with Store(path).connect() as migrated:
+        assert migrated.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert "epoch" in {row[1] for row in migrated.execute("PRAGMA table_info(leases)")}
+        assert "lease_epoch" in {row[1] for row in migrated.execute("PRAGMA table_info(events)")}
 
 
 def test_connect_corrects_preexisting_database_mode(tmp_path: Path) -> None:
@@ -108,16 +160,15 @@ def test_foreign_keys_and_checks_are_enforced(tmp_path: Path) -> None:
 def test_worker_completion_fields_must_be_set_together(tmp_path: Path) -> None:
     store = Store(tmp_path / "factory.db")
     store.initialize()
+    store.claim_ticket(ClaimRequest("issue", "run", "repo", "branch", "/work"), "owner", 1, "start")
+    lease = store.get_lease("issue")
     with store.connect() as connection:
         connection.execute(
-            "INSERT INTO runs(run_id, linear_issue_id, repository_key, branch, worktree, "
-            "machine_state, cycle_count, created_at, updated_at) "
-            "VALUES('run', 'issue', 'repo', 'branch', '/work', 'CLAIMING', 0, 't', 't')"
-        )
-        connection.execute(
             "INSERT INTO workers(worker_id, run_id, kind, tool, pid, pid_started_at, "
-            "started_at, heartbeat_at, artifact_dir) "
-            "VALUES('worker', 'run', 'implementer', 'codex', 1, 'start', 't', 't', '/artifacts')"
+            "started_at, heartbeat_at, artifact_dir, lease_epoch) "
+            "VALUES('worker', 'run', 'implementer', 'codex', 1, 'start', 't', 't', "
+            "'/artifacts', ?)",
+            (lease.epoch,),
         )
 
         with pytest.raises(sqlite3.IntegrityError):
@@ -125,7 +176,7 @@ def test_worker_completion_fields_must_be_set_together(tmp_path: Path) -> None:
                 "UPDATE workers SET finished_at = 'finished' WHERE worker_id = 'worker'"
             )
 
-    store.finish_worker("worker", 0)
+    store.finish_worker("worker", 0, lease)
     with store.connect() as connection:
         row = connection.execute(
             "SELECT finished_at, exit_code FROM workers WHERE worker_id = 'worker'"

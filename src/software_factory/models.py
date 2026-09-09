@@ -70,6 +70,7 @@ class Lease:
     acquired_at: datetime
     heartbeat_at: datetime
     expires_at: datetime
+    epoch: int
 
 
 @dataclass(frozen=True)
