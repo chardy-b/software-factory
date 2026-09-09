@@ -355,6 +355,17 @@ class Store:
             raise KeyError(linear_issue_id)
         return self._lease(row)
 
+    def get_run_for_issue(self, linear_issue_id: str) -> Run | None:
+        """Return the persisted run identity for reconciliation, if one exists."""
+        try:
+            with closing(self.connect()) as connection:
+                row = connection.execute(
+                    "SELECT * FROM runs WHERE linear_issue_id = ?", (linear_issue_id,)
+                ).fetchone()
+        except sqlite3.Error as exc:
+            _raise_store_error(exc)
+        return self._run(row) if row is not None else None
+
     def claim_ticket(
         self,
         request: ClaimRequest,
@@ -498,6 +509,23 @@ class Store:
             connection.execute(
                 "DELETE FROM leases WHERE linear_issue_id = ?",
                 (linear_issue_id,),
+            )
+
+    def rollback_claim(self, lease: Lease) -> None:
+        """Fence, record a failed external claim, and release its lease atomically."""
+        now = self.clock()
+        with self._transaction("IMMEDIATE") as connection:
+            self._require_lease(connection, lease)
+            self._refuse_live_worker(connection, lease.run_id, lease.epoch)
+            cursor = connection.execute(
+                "UPDATE runs SET machine_state = ?, updated_at = ? "
+                "WHERE run_id = ? AND lease_epoch = ?",
+                (MachineState.CLAIM_ROLLBACK, _timestamp(now), lease.run_id, lease.epoch),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseOwnershipError("run no longer matches the lease fence")
+            connection.execute(
+                "DELETE FROM leases WHERE run_id = ? AND epoch = ?", (lease.run_id, lease.epoch)
             )
 
     def park_lease_for_needs_input(
