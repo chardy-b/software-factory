@@ -34,6 +34,7 @@ packages = ["src/software_factory"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py312"
@@ -49,3 +50,4 @@ select = ["E", "F", "I", "UP", "B", "S"]
 python_version = "3.12"
 strict = true
 packages = ["software_factory"]
+mypy_path = "src"
