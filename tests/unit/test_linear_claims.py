@@ -62,10 +62,12 @@ def test_discovery_filters_server_side_and_caps_over_return() -> None:
                 "project": {"id": "p"},
                 "state": {"id": "r"},
                 "history": {
-                    "nodes": [{
-                        "createdAt": f"2026-01-{n + 1:02}T00:00:00Z",
-                        "toStateId": "r",
-                    }],
+                    "nodes": [
+                        {
+                            "createdAt": f"2026-01-{n + 1:02}T00:00:00Z",
+                            "toStateId": "r",
+                        }
+                    ],
                     "pageInfo": {"hasNextPage": False},
                 },
             }
@@ -86,57 +88,73 @@ def test_discovery_rejects_truncated_or_unmatched_ready_history() -> None:
         return {
             "data": {
                 "issues": {
-                    "nodes": [{
-                        "id": "i",
-                        "priority": 1,
-                        "project": {"id": "p"},
-                        "state": {"id": "r"},
-                        "history": history,
-                    }],
+                    "nodes": [
+                        {
+                            "id": "i",
+                            "priority": 1,
+                            "project": {"id": "p"},
+                            "state": {"id": "r"},
+                            "history": history,
+                        }
+                    ],
                     "pageInfo": {"hasNextPage": False},
                 }
             }
         }
 
     with pytest.raises(ClaimError, match="history is truncated"):
-        LinearAdapter(lambda _q, _v: response({
-            "nodes": [{"createdAt": "2026-01-01T00:00:00Z", "toStateId": "r"}],
-            "pageInfo": {"hasNextPage": True},
-        })).discover("p", "r", limit=1)
+        LinearAdapter(
+            lambda _q, _v: response(
+                {
+                    "nodes": [{"createdAt": "2026-01-01T00:00:00Z", "toStateId": "r"}],
+                    "pageInfo": {"hasNextPage": True},
+                }
+            )
+        ).discover("p", "r", limit=1)
 
     with pytest.raises(ClaimError, match="missing or ambiguous"):
-        LinearAdapter(lambda _q, _v: response({
-            "nodes": [{"createdAt": "2026-01-01T00:00:00Z", "toStateId": "other"}],
-            "pageInfo": {"hasNextPage": False},
-        })).discover("p", "r", limit=1)
+        LinearAdapter(
+            lambda _q, _v: response(
+                {
+                    "nodes": [{"createdAt": "2026-01-01T00:00:00Z", "toStateId": "other"}],
+                    "pageInfo": {"hasNextPage": False},
+                }
+            )
+        ).discover("p", "r", limit=1)
 
 
 def test_issue_snapshot_uses_inverse_blockers_and_matching_ready_transition() -> None:
     def transport(query: str, _variables: dict[str, object]) -> object:
         assert "inverseRelations" in query
         assert "issue { id state { type } }" in query
-        return {"data": {"issue": {
-            "id": "issue-1",
-            "priority": 1,
-            "project": {"id": "project"},
-            "state": {"id": "ready"},
-            "history": {
-                "nodes": [
-                    {"createdAt": "2024-01-01T00:00:00Z", "toStateId": "ready"},
-                    {"createdAt": "2025-01-01T00:00:00Z", "toStateId": "other"},
-                    {"createdAt": "2026-01-01T00:00:00Z", "toStateId": "ready"},
-                ],
-                "pageInfo": {"hasNextPage": False},
-            },
-            "comments": {"nodes": [], "pageInfo": {"hasNextPage": False}},
-            "inverseRelations": {
-                "nodes": [{
-                    "type": "blocks",
-                    "issue": {"id": "blocker", "state": {"type": "started"}},
-                }],
-                "pageInfo": {"hasNextPage": False},
-            },
-        }}}
+        return {
+            "data": {
+                "issue": {
+                    "id": "issue-1",
+                    "priority": 1,
+                    "project": {"id": "project"},
+                    "state": {"id": "ready"},
+                    "history": {
+                        "nodes": [
+                            {"createdAt": "2024-01-01T00:00:00Z", "toStateId": "ready"},
+                            {"createdAt": "2025-01-01T00:00:00Z", "toStateId": "other"},
+                            {"createdAt": "2026-01-01T00:00:00Z", "toStateId": "ready"},
+                        ],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                    "comments": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                    "inverseRelations": {
+                        "nodes": [
+                            {
+                                "type": "blocks",
+                                "issue": {"id": "blocker", "state": {"type": "started"}},
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                }
+            }
+        }
 
     snapshot = LinearAdapter(transport).get_issue("issue-1", "ready")
     assert snapshot.ready_at == NOW
@@ -154,10 +172,14 @@ def test_issue_snapshot_rejects_malformed_or_truncated_history() -> None:
     }
 
     for history in (
-        {"nodes": [{"createdAt": "not-a-date", "toStateId": "ready"}],
-         "pageInfo": {"hasNextPage": False}},
-        {"nodes": [{"createdAt": "2026-01-01T00:00:00Z", "toStateId": "ready"}],
-         "pageInfo": {"hasNextPage": True}},
+        {
+            "nodes": [{"createdAt": "not-a-date", "toStateId": "ready"}],
+            "pageInfo": {"hasNextPage": False},
+        },
+        {
+            "nodes": [{"createdAt": "2026-01-01T00:00:00Z", "toStateId": "ready"}],
+            "pageInfo": {"hasNextPage": True},
+        },
     ):
         raw = {**base, "history": history}
         with pytest.raises(ClaimError):

@@ -455,8 +455,8 @@ class ClaimCoordinator:
                 raise ClaimError("post-mutation readback found duplicate claim markers")
             return run
         except Exception as exc:
-            failure = exc if isinstance(exc, ClaimError) else ClaimError(
-                "Linear claim mutation failed"
+            failure = (
+                exc if isinstance(exc, ClaimError) else ClaimError("Linear claim mutation failed")
             )
             try:
                 self.store.rollback_claim(lease)
